@@ -1,0 +1,201 @@
+version: "3.9"
+
+# =============================================================================
+# Microservices Demo — Docker Compose Orchestration
+# Services: gateway, identity, order, payment, frontend
+# Infra:    PostgreSQL (x3), RabbitMQ
+# =============================================================================
+
+services:
+
+  # ── Message Broker ──────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI → http://localhost:15672 (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - microservices-net
+
+  # ── Databases ───────────────────────────────────────────────────────────────
+  identity-db:
+    image: postgres:16-alpine
+    container_name: identity-db
+    environment:
+      POSTGRES_DB: IdentityDb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - identity-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d IdentityDb"]
+      interval: 5s
+      retries: 10
+    networks:
+      - microservices-net
+
+  order-db:
+    image: postgres:16-alpine
+    container_name: order-db
+    environment:
+      POSTGRES_DB: OrderDb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - order-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d OrderDb"]
+      interval: 5s
+      retries: 10
+    networks:
+      - microservices-net
+
+  payment-db:
+    image: postgres:16-alpine
+    container_name: payment-db
+    environment:
+      POSTGRES_DB: PaymentDb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - payment-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d PaymentDb"]
+      interval: 5s
+      retries: 10
+    networks:
+      - microservices-net
+
+  # ── Microservices ────────────────────────────────────────────────────────────
+  identity-api:
+    build:
+      context: .
+      dockerfile: src/Services/Identity/Identity.API/Dockerfile
+    container_name: identity-api
+    ports:
+      - "5100:8080"   # REST
+      - "5101:8081"   # gRPC
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: "http://+:8080;http://+:8081"
+      ConnectionStrings__DefaultConnection: "Host=identity-db;Port=5432;Database=IdentityDb;Username=postgres;Password=postgres"
+      JwtSettings__SecretKey: "CHANGE_THIS_TO_A_STRONG_32+_CHARACTER_SECRET_KEY_IN_PRODUCTION"
+      JwtSettings__Issuer: "MicroservicesDemo.Identity"
+      JwtSettings__Audience: "MicroservicesDemo.Clients"
+      JwtSettings__ExpiresInMinutes: "60"
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Username: guest
+      RabbitMQ__Password: guest
+    depends_on:
+      identity-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - microservices-net
+
+  order-api:
+    build:
+      context: .
+      dockerfile: src/Services/Order/Order.API/Dockerfile
+    container_name: order-api
+    ports:
+      - "5200:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__DefaultConnection: "Host=order-db;Port=5432;Database=OrderDb;Username=postgres;Password=postgres"
+      JwtSettings__SecretKey: "CHANGE_THIS_TO_A_STRONG_32+_CHARACTER_SECRET_KEY_IN_PRODUCTION"
+      JwtSettings__Issuer: "MicroservicesDemo.Identity"
+      JwtSettings__Audience: "MicroservicesDemo.Clients"
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Username: guest
+      RabbitMQ__Password: guest
+      GrpcSettings__IdentityServiceUrl: "http://identity-api:8081"
+    depends_on:
+      order-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - microservices-net
+
+  payment-api:
+    build:
+      context: .
+      dockerfile: src/Services/Payment/Payment.API/Dockerfile
+    container_name: payment-api
+    ports:
+      - "5300:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__DefaultConnection: "Host=payment-db;Port=5432;Database=PaymentDb;Username=postgres;Password=postgres"
+      JwtSettings__SecretKey: "CHANGE_THIS_TO_A_STRONG_32+_CHARACTER_SECRET_KEY_IN_PRODUCTION"
+      JwtSettings__Issuer: "MicroservicesDemo.Identity"
+      JwtSettings__Audience: "MicroservicesDemo.Clients"
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Username: guest
+      RabbitMQ__Password: guest
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - microservices-net
+
+  gateway:
+    build:
+      context: .
+      dockerfile: src/Services/Gateway/ApiGateway/Dockerfile
+    container_name: gateway
+    ports:
+      - "5000:8080"    # ← single public entry point for all clients
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      JwtSettings__SecretKey: "CHANGE_THIS_TO_A_STRONG_32+_CHARACTER_SECRET_KEY_IN_PRODUCTION"
+      JwtSettings__Issuer: "MicroservicesDemo.Identity"
+      JwtSettings__Audience: "MicroservicesDemo.Clients"
+      ReverseProxy__Clusters__identity-cluster__Destinations__identity-service/destination1__Address: "http://identity-api:8080"
+      ReverseProxy__Clusters__order-cluster__Destinations__order-service/destination1__Address: "http://order-api:8080"
+      ReverseProxy__Clusters__payment-cluster__Destinations__payment-service/destination1__Address: "http://payment-api:8080"
+    depends_on:
+      - identity-api
+      - order-api
+      - payment-api
+    networks:
+      - microservices-net
+
+  # ── React Frontend ───────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - gateway
+    networks:
+      - microservices-net
+
+# ── Volumes & Networks ────────────────────────────────────────────────────────
+volumes:
+  rabbitmq-data:
+  identity-db-data:
+  order-db-data:
+  payment-db-data:
+
+networks:
+  microservices-net:
+    driver: bridge
